@@ -17,6 +17,7 @@ using System.Windows.Shapes;
 using NAudio.Wave;
 using System.Net;
 using System.Net.Sockets;
+using System.ComponentModel;
 
 namespace QuickVoice
 {
@@ -30,13 +31,13 @@ namespace QuickVoice
 
 
 
-        public MainWindow(StartupEventArgs e)
+        public MainWindow(StartupEventArgs ee)
         {
 
             IPEndPoint listen = null;
             IPEndPoint connect = null;
 
-            string[] args = e.Args;
+            string[] args = ee.Args;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -72,8 +73,15 @@ namespace QuickVoice
 
             InitializeComponent();
 
-            new Thread(() => new VoipModule().RunMicrophone(listen, connect)).Start();
+            var exitTokenSource = new CancellationTokenSource();
+
+            new Thread(() => new VoipModule().RunMicrophone(listen, connect, exitTokenSource.Token)).Start();
+
+            
+
+            Closing += (s, e) => { exitTokenSource.Cancel(); };
         }
+
 
         Regex patHostPort = new Regex(@"^\s*([a-zA-Z0-9.]+):([0-9]+)\s*$");
         Regex patPort = new Regex(@"^\s*([0-9]+)\s*$");
@@ -120,6 +128,10 @@ namespace QuickVoice
             return new IPEndPoint(ipAddress, Convert.ToInt32(port));
         }
 
+        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+
+        }
     }
 
     class VoipModule : IWaveProvider
@@ -128,20 +140,21 @@ namespace QuickVoice
         private WaveOut player;
         const int HEADER_LEN = 12;
 
-        public void RunMicrophone(IPEndPoint listen, IPEndPoint connect)
+        public void RunMicrophone(IPEndPoint listen, IPEndPoint connect, CancellationToken exitToken)
         {
             if (listen != null)
             {
                 TcpListener tcpListener = new TcpListener(listen);
                 tcpListener.Start();
+                exitToken.Register(() => { tcpListener.Stop(); });
                 TcpClient tcpClient = tcpListener.AcceptTcpClient();
-                RunMicrophone(tcpClient);
+                RunMicrophone(tcpClient, exitToken);
             }
             else if (connect != null)
             {
                 TcpClient tcpClient = new TcpClient(connect.AddressFamily);
                 tcpClient.Connect(connect);
-                RunMicrophone(tcpClient);
+                RunMicrophone(tcpClient, exitToken);
             }
             else
             {
@@ -150,7 +163,7 @@ namespace QuickVoice
 
         }
 
-        public void RunMicrophone(TcpClient tcpClient) {
+        public void RunMicrophone(TcpClient tcpClient, CancellationToken exitToken) {
             tcpClient.NoDelay = true;
 
             recorder = new WaveIn(WaveCallbackInfo.FunctionCallback());
@@ -165,22 +178,25 @@ namespace QuickVoice
             player.Init(this);
 
             player.Play(); // Is no problem, will output zeros until data start rolling in.
+            
 
-
-            new Thread(() => RunTcpReceiver(tcpClient)).Start();
+            new Thread(() => RunTcpReceiver(tcpClient, exitToken)).Start();
 
 
             recorder.StartRecording();
+
+            exitToken.Register(() => { player.Stop(); recorder.StopRecording(); });
         }
 
-        private void RunTcpReceiver(TcpClient tcpClient)
+        private void RunTcpReceiver(TcpClient tcpClient, CancellationToken exitToken)
         {
             NetworkStream stream = tcpClient.GetStream();
+            exitToken.Register(() => { stream.Close(); });
 
             byte[] header = new byte[HEADER_LEN];
             byte[] buf = new byte[10000];
 
-            for (;;)
+            while (!exitToken.IsCancellationRequested)
             {
 
                 int rem = HEADER_LEN;
