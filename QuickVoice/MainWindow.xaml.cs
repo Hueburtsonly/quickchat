@@ -34,7 +34,7 @@ namespace QuickVoice
         {
 
             IPEndPoint listen = null;
-            IPEndPoint remote = null;
+            IPEndPoint connect = null;
 
             string[] args = e.Args;
 
@@ -52,8 +52,8 @@ namespace QuickVoice
                     case "listen":
                         listen = parseHostAndPort(value);
                         break;
-                    case "remote":
-                        remote = parseHostAndPort(value);
+                    case "connect":
+                        connect = parseHostAndPort(value);
                         break;
                     default:
                         throw new NotImplementedException("Unknown flag: '" + flag + "'");
@@ -61,18 +61,18 @@ namespace QuickVoice
 
             }
 
-            if (listen == null && remote == null)
+            if (listen == null && connect == null)
             {
-                //throw new NotImplementedException("Must specify --listen or --remote.");
+                throw new NotImplementedException("Must specify --listen or --connect.");
             }
-            if (listen != null && remote != null)
+            if (listen != null && connect != null)
             {
-                throw new NotImplementedException("Must specify only one of --listen or --remote.");
+                throw new NotImplementedException("Must specify only one of --listen or --connect.");
             }
 
             InitializeComponent();
 
-            new Thread(() => new VoipModule().RunMicrophone(listen, remote)).Start();
+            new Thread(() => new VoipModule().RunMicrophone(listen, connect)).Start();
         }
 
         Regex patHostPort = new Regex(@"^\s*([a-zA-Z0-9.]+):([0-9]+)\s*$");
@@ -106,7 +106,14 @@ namespace QuickVoice
             IPAddress ipAddress = IPAddress.Any;
             if (host != null)
             {
-                ipAddress = Dns.GetHostEntry(host).AddressList[0];
+                foreach (IPAddress candidate in Dns.GetHostEntry(host).AddressList)
+                {
+                    if (candidate.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        ipAddress = candidate;
+                        break;
+                    }
+                }
             }
 
             // TODO: hostInfo.IPAddress might be empty.
@@ -119,23 +126,21 @@ namespace QuickVoice
     {
         private WaveIn recorder;
         private WaveOut player;
+        const int HEADER_LEN = 12;
 
-        public void RunMicrophone(IPEndPoint listen, IPEndPoint remote)
+        public void RunMicrophone(IPEndPoint listen, IPEndPoint connect)
         {
-            RunMicrophone(null);
-            return;
             if (listen != null)
             {
                 TcpListener tcpListener = new TcpListener(listen);
                 tcpListener.Start();
                 TcpClient tcpClient = tcpListener.AcceptTcpClient();
-                tcpListener.Stop();
                 RunMicrophone(tcpClient);
             }
-            else if (remote != null)
+            else if (connect != null)
             {
-                TcpClient tcpClient = new TcpClient();
-                tcpClient.Connect(remote);
+                TcpClient tcpClient = new TcpClient(connect.AddressFamily);
+                tcpClient.Connect(connect);
                 RunMicrophone(tcpClient);
             }
             else
@@ -146,11 +151,12 @@ namespace QuickVoice
         }
 
         public void RunMicrophone(TcpClient tcpClient) {
-            //tcpClient.NoDelay = true;
+            tcpClient.NoDelay = true;
 
             recorder = new WaveIn(WaveCallbackInfo.FunctionCallback());
             recorder.BufferMilliseconds = 5;
             recorder.NumberOfBuffers = 2;
+            recorderStream = tcpClient.GetStream();
             recorder.DataAvailable += MicrophoneDataAvailable;
             recorder.WaveFormat = new WaveFormat(8000, 16, 1);
 
@@ -160,11 +166,63 @@ namespace QuickVoice
 
             player.Play(); // Is no problem, will output zeros until data start rolling in.
 
-            
-            // TODO: Launch TCP -> cbuffer thread.
-            
+
+            new Thread(() => RunTcpReceiver(tcpClient)).Start();
+
 
             recorder.StartRecording();
+        }
+
+        private void RunTcpReceiver(TcpClient tcpClient)
+        {
+            NetworkStream stream = tcpClient.GetStream();
+
+            byte[] header = new byte[HEADER_LEN];
+            byte[] buf = new byte[10000];
+
+            for (;;)
+            {
+
+                int rem = HEADER_LEN;
+                int pos = 0;
+                do
+                {
+                    int tr = stream.Read(header, pos, rem);
+                    if (tr == 0) return;
+                    pos += tr;
+                    rem -= tr;
+                } while (rem != 0);
+
+                int buflen = BitConverter.ToInt32(header, 0);
+                float multiplier = BitConverter.ToSingle(header, 4);
+
+                if (buflen > 10000)
+                {
+                    throw new NotImplementedException("buflen > 10000!?");
+                }
+
+                rem = buflen;
+                pos = 0;
+                do
+                {
+                    int tr = stream.Read(buf, pos, rem);
+                    if (tr == 0) return;
+                    pos += tr;
+                    rem -= tr;
+                } while (rem != 0);
+
+                for (int i = 0; i < buflen; i++)
+                {
+                    short sample = (short)((sbyte)(buf[i]) * multiplier);
+                    cbuffer[writePointer] = (byte)(sample & 0xff);
+                    cbuffer[writePointer + 1] = (byte)((sample >> 8) & 0xff);
+                    writePointer = (writePointer + 2) % N;
+                    if (writePointer == readPointer)
+                    {
+                        throw new NotImplementedException("BufferOverrunWrite");
+                    }
+                }
+            }
         }
 
 
@@ -173,6 +231,7 @@ namespace QuickVoice
         byte[] cbuffer = new byte[N];
         int readPointer = 0;
         int writePointer = 0;
+        private NetworkStream recorderStream;
 
         public WaveFormat WaveFormat => new WaveFormat(8000, 16, 1);
 
@@ -202,42 +261,42 @@ namespace QuickVoice
 
         private void MicrophoneDataAvailable(object sender, WaveInEventArgs waveInEventArgs)
         {
-            //bufferedWaveProvider.AddSamples(waveInEventArgs.Buffer, 0, waveInEventArgs.BytesRecorded);
-
-            /*
-
+ 
             int sampleCount = waveInEventArgs.BytesRecorded / 2;
             float[] samples = new float[sampleCount];
-            float max = 0;
+            byte[] sendbuf = new byte[sampleCount];
+            float multiplier = 0;
             for (int i = 0; i < sampleCount; i++)
             {
                 samples[i] = (short)((int)(waveInEventArgs.Buffer[2 * i]) + (((int)(waveInEventArgs.Buffer[2 * i + 1])) << 8));
                 float unsignedf = Math.Abs(samples[i]);
-                if (unsignedf > max)
+                if (unsignedf > multiplier)
                 {
-                    max = unsignedf;
+                    multiplier = unsignedf;
                 }
             }
-            */
-
-            byte[] lb = waveInEventArgs.Buffer;
-
-            for (int i = 0; i < waveInEventArgs.BytesRecorded; i++)
+            multiplier /= 125;
+            for (int i = 0; i < sampleCount; i++)
             {
-                cbuffer[writePointer] = lb[i];
-                writePointer = (writePointer + 1) % N;
-                if (writePointer == readPointer)
-                {
-
-                    Console.WriteLine("BufferOverrunWrite");
-                    return;
-                }
+                sendbuf[i] = (byte)(sbyte)((samples[i] / multiplier) + 0.5);
             }
 
-
-            // TODO: Send data via TCP instead of looping back.
-
+            byte[] bytesToSend = BitConverter.GetBytes((int)sampleCount).Concat(BitConverter.GetBytes(multiplier)).Concat(BitConverter.GetBytes((int)0)).Concat(sendbuf).ToArray();
+            recorderStream.Write(bytesToSend, 0, bytesToSend.Length);
 
         }
+
+        /*
+         
+        Packet format:
+
+         0 -  3: BufLen (int32)
+         4 -  7: Multiplier (float)
+         8 - 11: 
+        12 - ..: Samples (signed byte each
+
+
+
+    */
     }
 }
