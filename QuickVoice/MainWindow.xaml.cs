@@ -18,6 +18,7 @@ using NAudio.Wave;
 using System.Net;
 using System.Net.Sockets;
 using System.ComponentModel;
+using System.IO;
 
 namespace QuickVoice
 {
@@ -75,9 +76,18 @@ namespace QuickVoice
 
             var exitTokenSource = new CancellationTokenSource();
 
-            new Thread(() => new VoipModule().RunMicrophone(listen, connect, exitTokenSource.Token)).Start();
-
-            
+            new Thread(() =>
+            {
+                new VoipModule(this).Run(listen, connect, exitTokenSource.Token);
+                try
+                {
+                    this.Dispatcher.Invoke(() => Close());
+                }
+                catch (TaskCanceledException)
+                {
+                    // Eh.
+                }
+            }).Start();
 
             Closing += (s, e) => { exitTokenSource.Cancel(); };
         }
@@ -128,9 +138,16 @@ namespace QuickVoice
             return new IPEndPoint(ipAddress, Convert.ToInt32(port));
         }
 
-        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+        public void updateStatus(string status)
         {
-
+            try
+            {
+                this.Dispatcher.Invoke(() => lblStatus.Content = status);
+            }
+            catch (TaskCanceledException)
+            {
+                // Eh.
+            }
         }
     }
 
@@ -138,33 +155,72 @@ namespace QuickVoice
     {
         private WaveIn recorder;
         private WaveOut player;
+        private MainWindow mainWindow;
         const int HEADER_LEN = 12;
 
-        public void RunMicrophone(IPEndPoint listen, IPEndPoint connect, CancellationToken exitToken)
+        public VoipModule(MainWindow mainWindow)
+        {
+            this.mainWindow = mainWindow;
+        }
+
+        public void Run(IPEndPoint listen, IPEndPoint connect, CancellationToken exitToken)
         {
             if (listen != null)
             {
                 TcpListener tcpListener = new TcpListener(listen);
                 tcpListener.Start();
                 exitToken.Register(() => { tcpListener.Stop(); });
-                TcpClient tcpClient = tcpListener.AcceptTcpClient();
-                RunMicrophone(tcpClient, exitToken);
+                while (!exitToken.IsCancellationRequested)
+                {
+                    mainWindow.updateStatus(string.Format("Listening for connections..."));
+                    TcpClient tcpClient;
+                    try
+                    {
+                        tcpClient = tcpListener.AcceptTcpClient();
+                    }
+                    catch (SocketException)
+                    {
+                        break;
+                    }
+
+                    Run(tcpClient, exitToken);
+                    mainWindow.updateStatus(string.Format("Disconnected."));
+                }
             }
             else if (connect != null)
             {
-                TcpClient tcpClient = new TcpClient(connect.AddressFamily);
-                tcpClient.Connect(connect);
-                RunMicrophone(tcpClient, exitToken);
+                for (;;)
+                {
+                    mainWindow.updateStatus(string.Format("Connecting to {0}:{1}...", connect.Address, connect.Port));
+                    TcpClient tcpClient = new TcpClient(connect.AddressFamily);
+                    try
+                    {
+                        tcpClient.Connect(connect);
+                        Run(tcpClient, exitToken);
+                        mainWindow.updateStatus(string.Format("Disconnected."));
+                    }
+                    catch (SocketException e)
+                    {
+                        mainWindow.updateStatus(string.Format("Failed to connect: {0}", e.Message));
+                    }
+                    if (exitToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    Thread.Sleep(1000);
+                }
             }
             else
             {
                 throw new NotImplementedException("Unreachable");
             }
-
         }
 
-        public void RunMicrophone(TcpClient tcpClient, CancellationToken exitToken) {
+        public void Run(TcpClient tcpClient, CancellationToken exitToken)
+        {
+            mainWindow.updateStatus(string.Format("Connected."));
             tcpClient.NoDelay = true;
+            exitToken.Register(() => tcpClient.Close());
 
             recorder = new WaveIn(WaveCallbackInfo.FunctionCallback());
             recorder.BufferMilliseconds = 5;
@@ -178,14 +234,15 @@ namespace QuickVoice
             player.Init(this);
 
             player.Play(); // Is no problem, will output zeros until data start rolling in.
-            
-
-            new Thread(() => RunTcpReceiver(tcpClient, exitToken)).Start();
-
-
             recorder.StartRecording();
 
-            exitToken.Register(() => { player.Stop(); recorder.StopRecording(); });
+            RunTcpReceiver(tcpClient, exitToken);
+
+            player.Stop();
+            recorder.StopRecording();
+
+            player = null;
+            recorder = null;
         }
 
         private void RunTcpReceiver(TcpClient tcpClient, CancellationToken exitToken)
@@ -203,10 +260,18 @@ namespace QuickVoice
                 int pos = 0;
                 do
                 {
-                    int tr = stream.Read(header, pos, rem);
-                    if (tr == 0) return;
-                    pos += tr;
-                    rem -= tr;
+                    try
+                    {
+                        int tr = stream.Read(header, pos, rem);
+                        if (tr == 0) return;
+                        pos += tr;
+                        rem -= tr;
+                    }
+                    catch (IOException)
+                    {
+                        return;
+                    }
+
                 } while (rem != 0);
 
                 int buflen = BitConverter.ToInt32(header, 0);
@@ -221,10 +286,17 @@ namespace QuickVoice
                 pos = 0;
                 do
                 {
-                    int tr = stream.Read(buf, pos, rem);
-                    if (tr == 0) return;
-                    pos += tr;
-                    rem -= tr;
+                    try
+                    {
+                        int tr = stream.Read(buf, pos, rem);
+                        if (tr == 0) return;
+                        pos += tr;
+                        rem -= tr;
+                    }
+                    catch (IOException)
+                    {
+                        return;
+                    }
                 } while (rem != 0);
 
                 for (int i = 0; i < buflen; i++)
@@ -272,12 +344,12 @@ namespace QuickVoice
         }
 
 
- 
+
 
 
         private void MicrophoneDataAvailable(object sender, WaveInEventArgs waveInEventArgs)
         {
- 
+
             int sampleCount = waveInEventArgs.BytesRecorded / 2;
             float[] samples = new float[sampleCount];
             byte[] sendbuf = new byte[sampleCount];
@@ -298,8 +370,18 @@ namespace QuickVoice
             }
 
             byte[] bytesToSend = BitConverter.GetBytes((int)sampleCount).Concat(BitConverter.GetBytes(multiplier)).Concat(BitConverter.GetBytes((int)0)).Concat(sendbuf).ToArray();
-            recorderStream.Write(bytesToSend, 0, bytesToSend.Length);
-
+            try
+            {
+                recorderStream.Write(bytesToSend, 0, bytesToSend.Length);
+            }
+            catch (IOException)
+            {
+                // Do nothing; the TCP receiver loop should break soon so the recording will stop soon enough as well.
+            }
+            catch (ObjectDisposedException)
+            {
+                // Do nothing; the TCP receiver loop should break soon so the recording will stop soon enough as well.
+            }
         }
 
         /*

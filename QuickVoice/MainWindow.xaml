@@ -5,8 +5,9 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:QuickVoice"
         mc:Ignorable="d"
-        Title="QuickChat" Height="350" Width="525">
+        Title="QuickChat" Height="350" Width="754.978">
     <Grid>
-        
+        <Label x:Name="lblStatus" Content="Loading..." VerticalAlignment="Top" Margin="10,10,10,0" Height="29"/>
+
     </Grid>
 </Window>
