@@ -19,6 +19,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.ComponentModel;
 using System.IO;
+using System.Diagnostics;
 
 namespace QuickVoice
 {
@@ -29,8 +30,6 @@ namespace QuickVoice
     {
 
         Regex patArg = new Regex(@"^--(\w+)=(\S*)$");
-
-
 
         public MainWindow(StartupEventArgs ee)
         {
@@ -149,10 +148,23 @@ namespace QuickVoice
                 // Eh.
             }
         }
+
+        public void updateStatus2(string status)
+        {
+            try
+            {
+                this.Dispatcher.Invoke(() => lblStatus2.Content = status);
+            }
+            catch (TaskCanceledException)
+            {
+                // Eh.
+            }
+        }
     }
 
     class VoipModule : IWaveProvider
     {
+        private Stopwatch stopwatch;
         private WaveIn recorder;
         private WaveOut player;
         private MainWindow mainWindow;
@@ -222,6 +234,8 @@ namespace QuickVoice
             tcpClient.NoDelay = true;
             exitToken.Register(() => tcpClient.Close());
 
+            stopwatch = Stopwatch.StartNew();
+
             recorder = new WaveIn(WaveCallbackInfo.FunctionCallback());
             recorder.BufferMilliseconds = 5;
             recorder.NumberOfBuffers = 2;
@@ -235,6 +249,27 @@ namespace QuickVoice
 
             player.Play(); // Is no problem, will output zeros until data start rolling in.
             recorder.StartRecording();
+
+
+            new Thread(() =>
+            {
+                try
+                {
+                    for (;;)
+                    {
+                        Thread.Sleep(100);
+
+                        long bytesDifference = bytesRecorded - (player.GetPosition() - playbackBytesInjected) + (((stopwatch.ElapsedTicks - bytesRecordedTs) * 8000 * 2 * 1) / Stopwatch.Frequency);
+
+                        int msDifference = (int)(bytesDifference / 8 / 2);
+
+                        mainWindow.updateStatus2(String.Format("{0}ms -- {1}%", msDifference, (((writePointer - readPointer + N) % N) * 100) / N));
+                    }
+                }
+                catch (Exception)
+                { }
+            }).Start();
+
 
             RunTcpReceiver(tcpClient, exitToken);
 
@@ -298,23 +333,25 @@ namespace QuickVoice
                         return;
                     }
                 } while (rem != 0);
-
-                for (int i = 0; i < buflen; i++)
+                lock (cbufferLock)
                 {
-                    short sample = (short)((sbyte)(buf[i]) * multiplier);
-                    cbuffer[writePointer] = (byte)(sample & 0xff);
-                    cbuffer[writePointer + 1] = (byte)((sample >> 8) & 0xff);
-                    writePointer = (writePointer + 2) % N;
-                    if (writePointer == readPointer)
+                    for (int i = 0; i < buflen; i++)
                     {
-                        throw new NotImplementedException("BufferOverrunWrite");
+                        short sample = (short)((sbyte)(buf[i]) * multiplier);
+                        cbuffer[writePointer] = (byte)(sample & 0xff);
+                        cbuffer[writePointer + 1] = (byte)((sample >> 8) & 0xff);
+                        writePointer = (writePointer + 2) % N;
+                        if (writePointer == readPointer)
+                        {
+                            throw new NotImplementedException("BufferOverrunWrite");
+                        }
                     }
                 }
             }
         }
 
 
-
+        private Object cbufferLock = new Object();
         const int N = 16000;
         byte[] cbuffer = new byte[N];
         int readPointer = 0;
@@ -325,30 +362,48 @@ namespace QuickVoice
 
         public int Read(byte[] buffer, int offset, int count)
         {
-
-
-            for (int i = 0; i < count; i++)
+            lock (cbufferLock)
             {
-                if (readPointer == writePointer)
+                for (int i = 0; i < count; i += 2)
                 {
-                    buffer[i + offset] = 0;
-                }
-                else
-                {
-                    buffer[i + offset] = cbuffer[readPointer];
-                    readPointer = (readPointer + 1) % N;
-                }
+                    if (readPointer == writePointer)
+                    {
+                        buffer[i + offset] = 0;
+                        buffer[i + offset + 1] = 0;
+                        playbackBytesInjected += 2;
+                    }
+                    else
+                    {
+                        buffer[i + offset] = cbuffer[readPointer];
+                        buffer[i + offset + 1] = cbuffer[readPointer + 1];
+                        readPointer = (readPointer + 2) % N;
+                    }
 
+                }
             }
             return count;
         }
 
 
-
-
+        int divider = 0;
+        int bytesRecorded = 0;
+        long bytesRecordedTs = 0;
+        int playbackBytesInjected = 0;
 
         private void MicrophoneDataAvailable(object sender, WaveInEventArgs waveInEventArgs)
         {
+            bytesRecordedTs = stopwatch.ElapsedTicks;
+            bytesRecorded += waveInEventArgs.BytesRecorded;
+
+            /*if (++divider == 20)
+            {
+                long bytesDifference = bytesRecorded - (player.GetPosition() - playbackBytesInjected);
+
+                int msDifference = (int)(bytesDifference / 8 / 2);
+
+                mainWindow.updateStatus2(String.Format("{0}ms -- {1}%", msDifference, (((writePointer - readPointer + N) % N) * 100) / N));
+                divider = 0;
+            }*/
 
             int sampleCount = waveInEventArgs.BytesRecorded / 2;
             float[] samples = new float[sampleCount];
@@ -369,7 +424,11 @@ namespace QuickVoice
                 sendbuf[i] = (byte)(sbyte)((samples[i] / multiplier) + 0.5);
             }
 
-            byte[] bytesToSend = BitConverter.GetBytes((int)sampleCount).Concat(BitConverter.GetBytes(multiplier)).Concat(BitConverter.GetBytes((int)0)).Concat(sendbuf).ToArray();
+            var enumerable = BitConverter.GetBytes((int)sampleCount).Concat(BitConverter.GetBytes(multiplier)).Concat(BitConverter.GetBytes((int)0)).Concat(sendbuf);
+
+
+
+            byte[] bytesToSend = enumerable.ToArray();
             try
             {
                 recorderStream.Write(bytesToSend, 0, bytesToSend.Length);
@@ -383,18 +442,38 @@ namespace QuickVoice
                 // Do nothing; the TCP receiver loop should break soon so the recording will stop soon enough as well.
             }
         }
-
-        /*
-         
-        Packet format:
-
-         0 -  3: BufLen (int32)
-         4 -  7: Multiplier (float)
-         8 - 11: 
-        12 - ..: Samples (signed byte each
-
-
-
-    */
     }
 }
+
+
+/*
+
+Packet format:
+
+ 0 -  3: BufLen (int32)
+ 4 -  7: Multiplier (float)
+ 8 - 11: 
+12 - ..: Samples (signed byte each
+
+Latency musings:
+
+    Define T=T0 as the time that MicrophoneDataAvailable is called with a 5ms packet; and assume that the last sample provided to the call is completely fresh.
+
+    Let nl be the one-way network latency.
+
+    At T = T0 + nl, the 5ms packet is copied into the remote cbuffer. Let T1 = T, and the W1 = writePointer corresponding to last sample.
+
+    At T = T2, Read is called (call time, not return time) to retrieve a 30ms packet. Let R2 = readPointer corresponding to last sample, which we assume will be played at T2 + 60ms.
+
+    If we assume that W1 = R1, then the samples are the same one, so we could say that the one-way mouth-to-ear delay is:
+
+       mte1 ?= (T2 + 60ms) - T0
+
+    However, R2 should slightly lag behind W1 (to prevent buffer underruns), so there is an additional delay:
+
+       mte1 = (T2 + 60ms) - T0 + (W1 - R2) / Fs
+
+    This figure is not that useful, as we don't care about the one-way delay. Also, it's very difficult to calculate as T0 and T2 are measured on different machines.
+
+
+*/

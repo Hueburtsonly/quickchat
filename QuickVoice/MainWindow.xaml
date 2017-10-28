@@ -8,6 +8,7 @@
         Title="QuickChat" Height="350" Width="754.978">
     <Grid>
         <Label x:Name="lblStatus" Content="Loading..." VerticalAlignment="Top" Margin="10,10,10,0" Height="29"/>
+        <Label x:Name="lblStatus2" Content="" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10,44,0,0" Width="727"/>
 
     </Grid>
 </Window>
