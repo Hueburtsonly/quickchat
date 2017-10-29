@@ -167,7 +167,7 @@ namespace QuickVoice
     {
         private Stopwatch stopwatch;
         private WaveIn recorder;
-        private WaveOut player;
+        private WaveOutEvent player;
         private MainWindow mainWindow;
         int FS;
 
@@ -252,7 +252,7 @@ namespace QuickVoice
             recorder.DataAvailable += MicrophoneDataAvailable;
             recorder.WaveFormat = new WaveFormat(FS, 16, 1);
 
-            player = new WaveOut(WaveCallbackInfo.FunctionCallback());
+            player = new WaveOutEvent();
             player.NumberOfBuffers = 4;
             player.DesiredLatency = 28;
             bytesPlayed = player.DesiredLatency * -FS / 500;
@@ -317,7 +317,6 @@ namespace QuickVoice
 
             while (!exitToken.IsCancellationRequested)
             {
-
                 int rem = HEADER_LEN;
                 int pos = 0;
                 do
@@ -398,8 +397,9 @@ namespace QuickVoice
         int discardTimeout = RDT;
         public int Read(byte[] buffer, int offset, int count)
         {
+            bytesPlayed = player.GetPosition();
             bytesPlayedTs = stopwatch.ElapsedTicks;
-            bytesPlayed += count;
+            
             lock (queue)
             {
                 short sample = 0;
