@@ -169,7 +169,6 @@ namespace QuickVoice
         private WaveIn recorder;
         private WaveOut player;
         private MainWindow mainWindow;
-        const int HEADER_LEN = 12;
         int FS;
 
         public VoipModule(MainWindow mainWindow, int sampleRate)
@@ -246,6 +245,7 @@ namespace QuickVoice
             recorder = new WaveIn(WaveCallbackInfo.FunctionCallback());
             bytesRecorded = 0;
             micDiscard = 200;
+            remoteBytesDifference = -1;
             recorder.BufferMilliseconds = 5;
             recorder.NumberOfBuffers = 4;
             recorderStream = tcpClient.GetStream();
@@ -266,13 +266,27 @@ namespace QuickVoice
              {
                  try
                  {
-
-
+                     const int delta = 20;
+                     int msDifference = 9999;
                      for (;;)
                      {
                          Thread.Sleep(100);
 
-                         int msDifference = (int)(localBytesDifference * (1000 / 2) / FS);
+                        
+                         if (remoteBytesDifference != -1)
+                         {
+                             int newMsDifference = (int)((localBytesDifference + remoteBytesDifference) * (1000 / 2) / FS);
+                             if (newMsDifference < msDifference - delta)
+                             {
+                                 msDifference = newMsDifference + delta;
+                             } else if (newMsDifference > msDifference + delta)
+                             {
+                                 msDifference = newMsDifference - delta;
+                             } else
+                             {
+                                 msDifference = (15 * msDifference + newMsDifference) / 16;
+                             }
+                         }
                          mainWindow.updateStatus2(String.Format("{0}ms -- {1}% -- {2} -- {3} -> {4}", msDifference, ((queue.Count * 100) / N), playbackBytesInjected + playbackBytesDiscarded, playbackBytesDiscarded, playbackBytesInjected));
 
                      }
@@ -322,43 +336,51 @@ namespace QuickVoice
 
                 } while (rem != 0);
 
-                int buflen = BitConverter.ToInt32(header, 0);
-                float multiplier = BitConverter.ToSingle(header, 4) * 1.5f;
-
-                if (buflen > 10000)
+                float action = BitConverter.ToInt16(header, 0);
+                if (action == PROTOCOL_LATENCY_REPORT)
                 {
-                    throw new NotImplementedException("buflen > 10000!?");
+                    remoteBytesDifference = BitConverter.ToInt32(header, 2);
                 }
-
-                rem = buflen;
-                pos = 0;
-                do
+                else if (action == PROTOCOL_WAVE)
                 {
-                    try
-                    {
-                        int tr = stream.Read(buf, pos, rem);
-                        if (tr == 0) return;
-                        pos += tr;
-                        rem -= tr;
-                    }
-                    catch (IOException)
-                    {
-                        return;
-                    }
-                } while (rem != 0);
+                    int buflen = BitConverter.ToInt16(header, 2);
+                    float multiplier = BitConverter.ToSingle(header, 4) * 1.5f;
 
-                //Console.WriteLine("Greetz {0} {1}", queue.Count, buflen);
-
-                lock (queue)
-                {
-                    for (int i = 0; i < buflen; i++)
+                    if (buflen > 10000)
                     {
-                        short sample = (short)((sbyte)(buf[i]) * multiplier);
-                        queue.Enqueue(sample);
-                        if (queue.Count > N)
+                        throw new NotImplementedException("buflen > 10000!?");
+                    }
+
+                    rem = buflen;
+                    pos = 0;
+                    do
+                    {
+                        try
                         {
-                            Console.WriteLine("BufferOverrun");
+                            int tr = stream.Read(buf, pos, rem);
+                            if (tr == 0) return;
+                            pos += tr;
+                            rem -= tr;
+                        }
+                        catch (IOException)
+                        {
                             return;
+                        }
+                    } while (rem != 0);
+
+                    //Console.WriteLine("Greetz {0} {1}", queue.Count, buflen);
+
+                    lock (queue)
+                    {
+                        for (int i = 0; i < buflen; i++)
+                        {
+                            short sample = (short)((sbyte)(buf[i]) * multiplier);
+                            queue.Enqueue(sample);
+                            if (queue.Count > N)
+                            {
+                                Console.WriteLine("BufferOverrun");
+                                return;
+                            }
                         }
                     }
                 }
@@ -423,12 +445,14 @@ namespace QuickVoice
 
 
         int micDiscard = 100;
+        int occasional = 0;
         int bytesRecorded = 0;
         long bytesPlayed = 0;
         long bytesPlayedTs = 0;
         int playbackBytesInjected = 0;
         int playbackBytesDiscarded = 0;
         volatile int localBytesDifference = 0;
+        volatile int remoteBytesDifference = -1;
 
         private void MicrophoneDataAvailable(object sender, WaveInEventArgs waveInEventArgs)
         {
@@ -436,9 +460,7 @@ namespace QuickVoice
             if (micDiscard > 0)
             {
                 --micDiscard;
-
                 return;
-                //divider = 0;
             }
 
             bytesRecorded += waveInEventArgs.BytesRecorded;
@@ -466,9 +488,13 @@ namespace QuickVoice
                 sendbuf[i] = (byte)(sbyte)((samples[i] / multiplier) + 0.5);
             }
 
-            var enumerable = BitConverter.GetBytes((int)sampleCount).Concat(BitConverter.GetBytes(multiplier)).Concat(BitConverter.GetBytes((int)0)).Concat(sendbuf);
+            var enumerable = BitConverter.GetBytes(PROTOCOL_WAVE).Concat(BitConverter.GetBytes((short)sampleCount)).Concat(BitConverter.GetBytes(multiplier)).Concat(sendbuf);
 
-
+            if (++occasional == 20)
+            {
+                occasional = 0;
+                enumerable = enumerable.Concat(BitConverter.GetBytes(PROTOCOL_LATENCY_REPORT)).Concat(BitConverter.GetBytes(localBytesDifference)).Concat(BitConverter.GetBytes((short)0));
+            }
 
             byte[] bytesToSend = enumerable.ToArray();
             try
@@ -484,6 +510,13 @@ namespace QuickVoice
                 // Do nothing; the TCP receiver loop should break soon so the recording will stop soon enough as well.
             }
         }
+
+        const int HEADER_LEN = 8;
+        const short PROTOCOL_WAVE = 0x1;
+        const short PROTOCOL_SILENCE = 0x2; // Not yet implemented.
+        const short PROTOCOL_LATENCY_REPORT = 0x11;
+        const short PROTOCOL_SILENCE_CUTOFF = 0x12; // Not yet implemented.
+
     }
 }
 
