@@ -245,14 +245,16 @@ namespace QuickVoice
 
             recorder = new WaveIn(WaveCallbackInfo.FunctionCallback());
             bytesRecorded = 0;
-            recorder.BufferMilliseconds = 10;
-            recorder.NumberOfBuffers = 2;
+            micDiscard = 200;
+            recorder.BufferMilliseconds = 5;
+            recorder.NumberOfBuffers = 4;
             recorderStream = tcpClient.GetStream();
             recorder.DataAvailable += MicrophoneDataAvailable;
             recorder.WaveFormat = new WaveFormat(FS, 16, 1);
 
             player = new WaveOut(WaveCallbackInfo.FunctionCallback());
-            player.DesiredLatency = 60;
+            player.NumberOfBuffers = 4;
+            player.DesiredLatency = 28;
             bytesPlayed = player.DesiredLatency * -FS / 500;
             player.Init(this);
 
@@ -370,7 +372,7 @@ namespace QuickVoice
 
         public WaveFormat WaveFormat => new WaveFormat(FS, 16, 1);
 
-        const int RDT = 15;
+        const int RDT = 40;
         int discardTimeout = RDT;
         public int Read(byte[] buffer, int offset, int count)
         {
@@ -378,9 +380,9 @@ namespace QuickVoice
             bytesPlayed += count;
             lock (queue)
             {
+                short sample = 0;
                 for (int i = 0; i < count; i += 2)
                 {
-                    short sample;
                     if (queue.TryDequeue(out sample))
                     {
                         buffer[i + offset] = (byte)(sample & 0xff);
@@ -388,14 +390,14 @@ namespace QuickVoice
                     }
                     else
                     {
-                        buffer[i + offset] = 0;
-                        buffer[i + offset + 1] = 0;
+                        buffer[i + offset] = (byte)(sample & 0xff);
+                        buffer[i + offset + 1] = (byte)((sample >> 8) & 0xff);
                         playbackBytesInjected += 2;
                         //Console.WriteLine("INJECT " + stopwatch.ElapsedMilliseconds);
                     }
 
                 }
-                if (queue.Count < 16)
+                if (queue.Count < 200)
                 {
                     discardTimeout = RDT;
                 }
@@ -420,9 +422,8 @@ namespace QuickVoice
         }
 
 
-        int divider = 0;
+        int micDiscard = 100;
         int bytesRecorded = 0;
-        long bytesRecordedTs = 0;
         long bytesPlayed = 0;
         long bytesPlayedTs = 0;
         int playbackBytesInjected = 0;
@@ -431,16 +432,20 @@ namespace QuickVoice
 
         private void MicrophoneDataAvailable(object sender, WaveInEventArgs waveInEventArgs)
         {
-            bytesRecordedTs = stopwatch.ElapsedTicks;
-            bytesRecorded += waveInEventArgs.BytesRecorded;
 
-            //if (++divider == 20)
+            if (micDiscard > 0)
             {
-                long estPos = bytesPlayed + (((stopwatch.ElapsedTicks - bytesPlayedTs) * FS * 2 * 1) / Stopwatch.Frequency);
-                localBytesDifference = (int)(bytesRecorded - (estPos - playbackBytesInjected));
+                --micDiscard;
 
+                return;
                 //divider = 0;
             }
+
+            bytesRecorded += waveInEventArgs.BytesRecorded;
+            long estPos = bytesPlayed + (((stopwatch.ElapsedTicks - bytesPlayedTs) * FS * 2 * 1) / Stopwatch.Frequency);
+            localBytesDifference = (int)(bytesRecorded - (estPos - playbackBytesInjected));
+
+
 
             int sampleCount = waveInEventArgs.BytesRecorded / 2;
             float[] samples = new float[sampleCount];
